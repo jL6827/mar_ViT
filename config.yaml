@@ -1,0 +1,19 @@
+# 基本配置，训练时可通过 --config 指定
+model:
+  embed_dim: 128
+  n_layers: 4
+  n_heads: 4
+  mlp_dim: 256
+  dropout: 0.1
+data:
+  max_tokens_per_sample: 200   # 当天最多 token 数 (观测点数)，超过会截断，不足会 padding
+  feat_dim: 8                  # 输入特征维度（lat,lon,depth,seg_id_norm,time_sin,time_cos,day_sin,day_cos）
+training:
+  epochs: 60
+  lr: 1e-4
+  weight_decay: 1e-5
+  train_frac: 0.85
+  seed: 42
+runtime:
+  batch_size: 8
+  device: cuda

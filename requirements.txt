@@ -1,0 +1,7 @@
+torch>=1.12.0
+torchvision
+pandas
+numpy
+scikit-learn
+tqdm
+pyyaml
