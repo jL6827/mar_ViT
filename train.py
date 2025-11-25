@@ -1,11 +1,17 @@
-# train.py (修改版：安全读取 config 值并显式转换类型，避免从 YAML 中得到字符串导致错误)
+# Updated train.py — 支持传入固定的训练/测试 CSV 文件（例如 processed_data_mean_train.csv / processed_data_mean_test.csv）
+# 如果提供 --train_csv 与 --test_csv，程序将直接使用这两个文件（不再按日期随机切分）。
+# 否则保持原有按日期随机划分（默认从单一 CSV 中按 train_frac 划分）。
+#
+# 用法示例（使用你预先分好的文件，80/20）：
+# python train.py --train_csv processed_data_mean_train.csv --test_csv processed_data_mean_test.csv --config config.yaml --device cuda --epochs 60 --batch_size 8 --fp16
+
 import os
 import argparse
 import yaml
 import random
 import numpy as np
 import torch
-from torch import nn, optim
+from torch import nn, optim, amp
 from torch.utils.data import DataLoader
 
 from dataset import DailyDataset, collate_fn
@@ -22,10 +28,6 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 def cfg_get(cfg, key_path, typ, default=None):
-    """
-    Get nested value from cfg by dot path, cast to typ, fallback to default.
-    Example: cfg_get(cfg, "training.lr", float, 1e-4)
-    """
     parts = key_path.split(".")
     obj = cfg
     try:
@@ -38,10 +40,8 @@ def cfg_get(cfg, key_path, typ, default=None):
     try:
         return typ(obj)
     except Exception:
-        # try converting from string with possible commas or spaces
         try:
             s = str(obj).strip()
-            # remove thousand separators
             s = s.replace(",", "")
             return typ(s)
         except Exception:
@@ -80,12 +80,10 @@ def evaluate_model(model, dataloader, device):
     return preds_by_day, targets_by_day, (all_preds, all_targets)
 
 def train(args):
-    # config
-    # 显式指定 encoding='utf-8' 以避免 Windows 上的编码问题
+    # 读取配置文件（显式指定编码，避免 Windows 下编码问题）
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
-    # 从 cfg 安全获取各类参数并做类型转换
     seed = cfg_get(cfg, "training.seed", int, 42)
     seed_everything(seed)
     ensure_dir("output")
@@ -103,12 +101,27 @@ def train(args):
     weight_decay = cfg_get(cfg, "training.weight_decay", float, 1e-5)
     cfg_epochs = cfg_get(cfg, "training.epochs", int, 60)
 
-    # Dataset split
-    full_ds = DailyDataset(args.data, max_tokens=max_tokens)
-    n = len(full_ds)
-    train_idx, val_idx = train_val_split_indices(n, train_frac=train_frac, seed=seed)
-    train_ds = DailyDataset(args.data, max_tokens=max_tokens, indices=train_idx)
-    val_ds = DailyDataset(args.data, max_tokens=max_tokens, indices=val_idx)
+    # ---------- 这里是修改点：支持外部提供固定训练/测试 CSV ----------
+    if args.train_csv is not None and args.test_csv is not None:
+        # 使用用户提供的固定训练和测试文件
+        print(f"Using provided train CSV: {args.train_csv}")
+        print(f"Using provided test  CSV: {args.test_csv}")
+        train_ds = DailyDataset(args.train_csv, max_tokens=max_tokens)
+        val_ds = DailyDataset(args.test_csv, max_tokens=max_tokens)
+        # 如果希望使用训练集统计量（如 lat/ lon/ depth / target）来标准化测试集，请把训练集的统计复制给测试集：
+        # 只有当 dataset.py 中定义了这些属性时才复制（防护性赋值）
+        attr_names = ["lat_mean", "lat_std", "lon_mean", "lon_std", "depth_mean", "depth_std",
+                      "target_mean", "target_std"]
+        for a in attr_names:
+            if hasattr(train_ds, a) and hasattr(val_ds, a):
+                setattr(val_ds, a, getattr(train_ds, a))
+    else:
+        # 原始行为：从单个 CSV 中按日期随机划分（train_frac）
+        full_ds = DailyDataset(args.data, max_tokens=max_tokens)
+        n = len(full_ds)
+        train_idx, val_idx = train_val_split_indices(n, train_frac=train_frac, seed=seed)
+        train_ds = DailyDataset(args.data, max_tokens=max_tokens, indices=train_idx)
+        val_ds = DailyDataset(args.data, max_tokens=max_tokens, indices=val_idx)
 
     # batch_size / epochs from args override config defaults
     batch_size = args.batch_size if args.batch_size is not None else cfg_get(cfg, "runtime.batch_size", int, 8)
@@ -130,21 +143,18 @@ def train(args):
     ).to(device)
 
     # 确保 lr/weight_decay 是数值
-    if not isinstance(lr, float) and not isinstance(lr, int):
-        try:
-            lr = float(lr)
-        except Exception:
-            lr = 1e-4
-    if not isinstance(weight_decay, float) and not isinstance(weight_decay, int):
-        try:
-            weight_decay = float(weight_decay)
-        except Exception:
-            weight_decay = 1e-5
+    try:
+        lr = float(lr)
+    except Exception:
+        lr = 1e-4
+    try:
+        weight_decay = float(weight_decay)
+    except Exception:
+        weight_decay = 1e-5
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.L1Loss(reduction='none')  # we'll mask manually
-
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16 and device.type == "cuda")
+    criterion = nn.L1Loss(reduction='none')
+    scaler = amp.GradScaler(enabled=(args.fp16 and device.type == "cuda"))
 
     best_val_loss = float('inf')
     log_rows = []
@@ -158,7 +168,8 @@ def train(args):
             targets = batch["targets"].to(device)
             mask = batch["mask"].to(device)
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=args.fp16 and device.type == "cuda"):
+
+            with amp.autocast(device_type='cuda', enabled=(args.fp16 and device.type == "cuda")):
                 outputs = model(feats, mask)
                 loss_all = criterion(outputs, targets)  # [B,T,4]
                 loss_masked = loss_all.mean(dim=-1) * mask  # [B,T]
@@ -178,15 +189,12 @@ def train(args):
         else:
             all_preds, all_targets = all_pair
             val_loss = np.abs(all_preds - all_targets).mean()
-            # save per-day and per-var
             save_eval_per_day(preds_by_day, targets_by_day, "output/eval_per_day.csv")
             save_eval_per_var(all_preds, all_targets, "output/eval_per_var.csv")
         log_rows.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        # save training log
         import pandas as pd
         pd.DataFrame(log_rows).to_csv("output/train_val_log.csv", index=False)
 
-        # save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
@@ -196,22 +204,22 @@ def train(args):
             }, "output/model_best.pt")
         print(f"Epoch {epoch}: train_loss={train_loss:.6e}, val_loss={val_loss:.6e}, best_val={best_val_loss:.6e}")
 
-    # final evaluation on validation set (already saved)
     print("Training finished. Best val loss:", best_val_loss)
     print("Outputs saved in output/")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="processed_data_mean.csv")
+    parser.add_argument("--data", type=str, default="processed_data_mean.csv", help="如果不提供 train/test 文件，程序会从此文件按日期划分")
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--train_csv", type=str, default=None, help="可选：指定训练文件（已预先划分好的 CSV）")
+    parser.add_argument("--test_csv", type=str, default=None, help="可选：指定测试文件（已预先划分好的 CSV）")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--fp16", action="store_true", help="Use AMP mixed precision (recommended for GPU)")
     args = parser.parse_args()
 
-    # load config then override (we still read it here to provide defaults if needed)
     with open(args.config, "r", encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
-    # if args.epochs or batch_size not provided they'll be resolved inside train()
+
     train(args)
